@@ -47,7 +47,7 @@ class ReliableSQLGenerator(dspy.Module):
     def __init__(self, schema: str, predictor=None):
         super().__init__()
         self.schema = schema
-        self.generate_sql = predictor if predictor is not None else dspy.ChainOfThought(TextToSQL)
+        self.generate_sql = predictor if predictor is not None else dspy.RLM(TextToSQL, max_iters=5, max_llm_calls=10)
 
     def forward(self, question: str) -> dspy.Prediction:
         sql = None
@@ -208,6 +208,58 @@ class TelegramBot:
         """Fica escutando o Telegram; o infinity_polling não para no primeiro erro de rede."""
         self.bot.infinity_polling()
 
+# GEPA
+
+TRAINSET = [
+    ("Quantos produtos existem?", "SELECT COUNT(*) FROM produto"),
+    ("Qual o preço do sabonete?", "SELECT preco FROM produto WHERE nome = 'sabonete'"),
+    ("Quais produtos custam mais de 10 reais?", "SELECT nome, preco FROM produto WHERE preco > 10"),
+    (
+        "Quais são os produtos do departamento de bebidas?",
+        "SELECT p.nome FROM produto p JOIN departamento d ON d.id = p.departamento_id WHERE d.nome = 'bebidas'",
+    ),
+    (
+        "Quantos lotes de leite há no estoque?",
+        "SELECT COUNT(*) FROM estoque e JOIN produto p ON p.id = e.produto_id WHERE p.nome = 'leite'",
+    ),
+    (
+        "Qual produto tem a maior quantidade em estoque?",
+        "SELECT p.nome, e.quantidade FROM estoque e JOIN produto p ON p.id = e.produto_id"
+        " ORDER BY e.quantidade DESC LIMIT 1",
+    ),
+    (
+        "Quais produtos vencem antes de 2027-01-01?",
+        "SELECT p.nome, e.data_vencimento FROM estoque e JOIN produto p ON p.id = e.produto_id"
+        " WHERE e.data_vencimento < '2027-01-01'",
+    ),
+    ("Qual a soma das unidades em estoque?", "SELECT SUM(quantidade) FROM estoque"),
+    ("Qual o preço médio dos produtos?", "SELECT AVG(preco) FROM produto"),
+    (
+        "Quantos produtos cada departamento tem?",
+        "SELECT d.nome, COUNT(p.id) FROM departamento d LEFT JOIN produto p ON p.departamento_id = d.id GROUP BY d.id",
+    ),
+]
+
+
+def metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+    if pred.error:
+        return dspy.Prediction(score=0.0, feedback=pred.error)
+    esperado = " ".join(gold.sql_query.split()).lower()
+    gerado = " ".join(pred.sql_query.split()).lower()
+    if esperado == gerado:
+        return dspy.Prediction(score=1.0, feedback="O SQL gerado é o esperado.")
+    return dspy.Prediction(score=0.0, feedback=f"Esperado: {gold.sql_query}. Gerado: {pred.sql_query}.")
+
+
+def optimize(generator: ReliableSQLGenerator) -> ReliableSQLGenerator:
+    trainset = [
+        dspy.Example(question=question, sql_query=sql).with_inputs("question")
+        for question, sql in TRAINSET
+    ]
+    optimizer = dspy.GEPA(metric=metric, max_full_evals=2, reflection_lm=dspy.settings.lm)
+    return optimizer.compile(generator, trainset=trainset)
+
+# GEPA
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -215,7 +267,7 @@ def main() -> None:
     if not token:
         raise SystemExit("Defina a variável de ambiente TELEGRAM_BOT_TOKEN antes de iniciar o bot.")
     configure_lm()
-    generator = ReliableSQLGenerator(SCHEMA)
+    generator = optimize(ReliableSQLGenerator(SCHEMA))
     TelegramBot(token, Text2SQLAgent(generator, StockApiClient()), WhisperTranscriber()).run()
 
 
